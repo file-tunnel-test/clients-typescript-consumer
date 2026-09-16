@@ -1,0 +1,128 @@
+name: ORES middleware generic TypeScript consumer
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ores-middleware-generic-ts-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ORES_MIDDLEWARE_SHA: 6ec6aca66d09797e1677ed70106bc31a74d63819
+
+jobs:
+  consumer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ORESoftware/ores-middleware
+          ref: ${{ env.ORES_MIDDLEWARE_SHA }}
+          path: middleware
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.1
+          package-manager-cache: false
+      - name: Prove immutable provider-agnostic upstream checkout
+        run: |
+          set -euo pipefail
+          test "$(git -C middleware rev-parse HEAD)" = "$ORES_MIDDLEWARE_SHA"
+          test -z "$(git -C middleware status --porcelain)"
+          ! grep -Eiq 'supabase|clerk|auth0|firebase|okta|cognito|keycloak|workos' middleware/src/ts/src/generic.ts
+      - name: Build, test, and pack upstream TypeScript package
+        run: |
+          set -euo pipefail
+          cd middleware/src/ts
+          npm ci
+          npm test
+          npm pack --silent > /tmp/ores-middleware-pack.txt
+      - name: Install packed artifact as an external consumer
+        run: |
+          set -euo pipefail
+          mkdir -p target/ores-middleware-consumer
+          cd target/ores-middleware-consumer
+          npm init -y >/dev/null
+          TARBALL="$(tail -n1 /tmp/ores-middleware-pack.txt)"
+          npm install "../../middleware/src/ts/$TARBALL"
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import {
+            composeMiddleware,
+            composeNamedMiddleware,
+            contextualFallibleProviderFrom,
+            providerFrom,
+          } from '@oresoftware/ores-middleware/generic';
+
+          const sdk = Object.freeze({ version: 'v42', prefix: 'sdk-v42:' });
+          const provider = providerFrom(async (token) => {
+            assert.equal(sdk.version, 'v42');
+            return { subject: token.slice(sdk.prefix.length) };
+          });
+          assert.deepEqual(await provider.verify('sdk-v42:alice'), { subject: 'alice' });
+
+          const sentinel = new Error('consumer-provider-failure');
+          const rejecting = providerFrom(async () => { throw sentinel; });
+          await assert.rejects(rejecting.verify('request'), (error) => error === sentinel);
+
+          const contextual = contextualFallibleProviderFrom(async (request, context) =>
+            request.ok
+              ? { ok: true, value: `${context.tenant}:accepted` }
+              : { ok: false, error: { code: 'rejected' } }
+          );
+          assert.deepEqual(
+            await contextual.verify({ request: { ok: true }, context: { tenant: 't-1' } }),
+            { ok: true, value: 't-1:accepted' },
+          );
+          assert.deepEqual(
+            await contextual.verify({ request: { ok: false }, context: { tenant: 't-1' } }),
+            { ok: false, error: { code: 'rejected' } },
+          );
+
+          const events = [];
+          const stage = (name) => (next) => async (request) => {
+            events.push(`${name}:before`);
+            const response = await next(request);
+            events.push(`${name}:after`);
+            return response;
+          };
+          const handler = composeMiddleware(
+            async (request) => `${request}:ok`,
+            stage('request-id'),
+            stage('consumer-auth-v42'),
+            stage('tenant-rate-limit'),
+          );
+          assert.equal(await handler('request'), 'request:ok');
+          assert.deepEqual(events, [
+            'request-id:before',
+            'consumer-auth-v42:before',
+            'tenant-rate-limit:before',
+            'tenant-rate-limit:after',
+            'consumer-auth-v42:after',
+            'request-id:after',
+          ]);
+
+          const duplicateEvents = [];
+          const named = (name) => ({
+            name,
+            middleware: (next) => async (request) => {
+              duplicateEvents.push(name);
+              return next(request);
+            },
+          });
+          const duplicateHandler = composeNamedMiddleware(
+            async (request) => request,
+            [named('auth'), named('auth'), named('audit')],
+          );
+          assert.equal(await duplicateHandler('request'), 'request');
+          assert.deepEqual(duplicateEvents, ['auth', 'auth', 'audit']);
+          NODE
