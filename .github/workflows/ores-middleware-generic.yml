@@ -51,7 +51,6 @@ jobs:
           mkdir -p target/ores-middleware-consumer
           cd target/ores-middleware-consumer
           npm init -y >/dev/null
-          TARBALL="$(tail -n1 ../../middleware/src/ts//tmp/never 2>/dev/null || true)"
           TARBALL="$(tail -n1 /tmp/ores-middleware-pack.txt)"
           npm install "../../middleware/src/ts/$TARBALL"
           node --input-type=module <<'NODE'
