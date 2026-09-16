@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  ORES_MIDDLEWARE_SHA: be15f5916efba836c875c2ba81b5e947960aa579
+  ORES_MIDDLEWARE_SHA: bd6d8d99b9e97a51b7cc01218e3602623270582d
 
 jobs:
   consumer:
