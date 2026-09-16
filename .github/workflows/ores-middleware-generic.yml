@@ -33,11 +33,12 @@ jobs:
         with:
           node-version: 22.23.1
           package-manager-cache: false
-      - name: Prove immutable upstream checkout
+      - name: Prove immutable provider-agnostic upstream checkout
         run: |
           set -euo pipefail
           test "$(git -C middleware rev-parse HEAD)" = "$ORES_MIDDLEWARE_SHA"
           test -z "$(git -C middleware status --porcelain)"
+          ! grep -Eiq 'supabase|clerk|auth0|firebase|okta|cognito|keycloak|workos' middleware/src/ts/src/generic.ts
       - name: Build, test, and pack upstream TypeScript package
         run: |
           set -euo pipefail
@@ -57,6 +58,7 @@ jobs:
           import assert from 'node:assert/strict';
           import {
             composeMiddleware,
+            composeNamedMiddleware,
             contextualFallibleProviderFrom,
             providerFrom,
           } from '@oresoftware/ores-middleware/generic';
@@ -68,6 +70,10 @@ jobs:
           });
           assert.deepEqual(await provider.verify('sdk-v42:alice'), { subject: 'alice' });
 
+          const sentinel = new Error('consumer-provider-failure');
+          const rejecting = providerFrom(async () => { throw sentinel; });
+          await assert.rejects(rejecting.verify('request'), (error) => error === sentinel);
+
           const contextual = contextualFallibleProviderFrom(async (request, context) =>
             request.ok
               ? { ok: true, value: `${context.tenant}:accepted` }
@@ -76,6 +82,10 @@ jobs:
           assert.deepEqual(
             await contextual.verify({ request: { ok: true }, context: { tenant: 't-1' } }),
             { ok: true, value: 't-1:accepted' },
+          );
+          assert.deepEqual(
+            await contextual.verify({ request: { ok: false }, context: { tenant: 't-1' } }),
+            { ok: false, error: { code: 'rejected' } },
           );
 
           const events = [];
@@ -100,4 +110,19 @@ jobs:
             'consumer-auth-v42:after',
             'request-id:after',
           ]);
+
+          const duplicateEvents = [];
+          const named = (name) => ({
+            name,
+            middleware: (next) => async (request) => {
+              duplicateEvents.push(name);
+              return next(request);
+            },
+          });
+          const duplicateHandler = composeNamedMiddleware(
+            async (request) => request,
+            [named('auth'), named('auth'), named('audit')],
+          );
+          assert.equal(await duplicateHandler('request'), 'request');
+          assert.deepEqual(duplicateEvents, ['auth', 'auth', 'audit']);
           NODE
